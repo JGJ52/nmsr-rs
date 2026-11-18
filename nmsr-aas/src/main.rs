@@ -18,6 +18,15 @@ pub mod model;
 mod routes;
 mod utils;
 
+use axum::{
+    extract::Request,
+    middleware,
+    response::Response,
+};
+use http::StatusCode;
+use serde::Deserialize;
+use std::collections::HashSet;
+use tokio::fs;
 use crate::{
     routes::{render, render_get_warning, render_post_warning, NMSRState},
     utils::tracing::NmsrTracing,
@@ -47,7 +56,53 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use twelf::Layer;
 use utils::config::TracingConfiguration;
+use url::Url;
 pub use utils::{caching, config, error};
+
+#[derive(Deserialize)]
+struct Origins(Vec<String>);
+
+async fn origin_check(
+    request: Request,
+    next: axum::middleware::Next,
+) -> Result<Response, StatusCode> {
+    let origin = if let Some(value) = request.headers().get("origin") {
+        value
+            .to_str()
+            .map_err(|_| StatusCode::FORBIDDEN)?
+            .to_string()
+    } else if let Some(value) = request.headers().get("referer") {
+        let referer = value
+            .to_str()
+            .map_err(|_| StatusCode::FORBIDDEN)?;
+
+        let url = Url::parse(referer)
+            .map_err(|_| StatusCode::FORBIDDEN)?;
+
+        format!(
+            "{}://{}",
+            url.scheme(),
+            url.host_str().ok_or(StatusCode::FORBIDDEN)?
+        )
+    } else {
+        return Ok(next.run(request).await);
+    };
+
+    let origins = fs::read_to_string("origins.json")
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let origins: Origins =
+        serde_json::from_str(&origins).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let allowed: HashSet<&str> = origins.0.iter().map(String::as_str).collect();
+
+    if !allowed.contains(origin.as_str()) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    Ok(next.run(request).await)
+}
 
 #[main]
 async fn main() -> anyhow::Result<()> {
@@ -114,6 +169,7 @@ async fn main() -> anyhow::Result<()> {
     > = NmsrTracing::new_trace_layer();
 
     let app = router
+        .layer(middleware::from_fn(origin_check))
         .layer(PropagateRequestIdLayer::new(HeaderName::from_static(
             "x-request-id",
         )))
